@@ -1,0 +1,40 @@
+{
+  "name": "whatsapp_hub_api",
+  "version": "1.0.0",
+  "description": "API REST para gestión de múltiples sesiones de WhatsApp con Baileys",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js"
+  },
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "6.7.21",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "jimp": "^1.6.1",
+    "multer": "^2.1.1",
+    "node-cache": "^5.1.2",
+    "pino": "^8.0.0",
+    "pino-pretty": "^10.0.0",
+    "socket.io": "^4.7.2",
+    "uuid": "^14.0.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "nodemonConfig": {
+    "ignore": [
+      "auth/*",
+      "uploads/*",
+      "data/*",
+      ".wwebjs_cache/*"
+    ]
+  }
+}

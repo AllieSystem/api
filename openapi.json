@@ -1,0 +1,639 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "MV WhatsApp Hub API",
+    "description": "API REST para gestión de múltiples sesiones de WhatsApp con Baileys. Permite manejar múltiples dispositivos vinculados con su propio historial de chats y sesiones.",
+    "version": "1.0.0",
+    "contact": {
+      "name": "Soporte Fovisste"
+    },
+    "license": {
+      "name": "MIT",
+      "url": "https://opensource.org/licenses/MIT"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:3000/api",
+      "description": "Servidor de desarrollo"
+    },
+    {
+      "url": "https://api.example.com/api",
+      "description": "Servidor de producción"
+    }
+  ],
+  "security": [
+    {
+      "ApiKeyAuth": []
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Verificar estado del servidor",
+        "tags": ["Sistema"],
+        "responses": {
+          "200": {
+            "description": "Servidor saludable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "example": true },
+                    "status": { "type": "string", "example": "healthy" },
+                    "version": { "type": "string", "example": "1.0.0" },
+                    "uptime": { "type": "number", "example": 3600 },
+                    "timestamp": { "type": "string", "format": "date-time" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/status": {
+      "get": {
+        "summary": "Obtener estado general de la API",
+        "tags": ["Sistema"],
+        "responses": {
+          "200": {
+            "description": "Estado de la API",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "api": { "type": "object" },
+                        "sessions": { "type": "object" },
+                        "keys": { "type": "object" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sessions": {
+      "get": {
+        "summary": "Listar todas las sesiones",
+        "tags": ["Sesiones"],
+        "security": [{ "ApiKeyAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Lista de sesiones",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "sessionId": { "type": "string" },
+                          "phoneNumber": { "type": "string" },
+                          "status": { "type": "string", "enum": ["disconnected", "waiting_qr", "waiting_pairing", "connected"] },
+                          "connectedAt": { "type": "string", "format": "date-time", "nullable": true }
+                        }
+                      }
+                    },
+                    "count": { "type": "integer" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Crear nueva sesión",
+        "tags": ["Sesiones"],
+        "security": [{ "ApiKeyAuth": [] }],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "phoneNumber": { "type": "string", "description": "Número de teléfono para emparejamiento", "example": "525556614579" },
+                  "options": {
+                    "type": "object",
+                    "properties": {
+                      "sessionId": { "type": "string", "description": "ID personalizado para la sesión" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Sesión creada exitosamente",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "sessionId": { "type": "string" },
+                        "phoneNumber": { "type": "string" },
+                        "status": { "type": "string" },
+                        "createdAt": { "type": "string" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error al crear sesión"
+          }
+        }
+      }
+    },
+    "/sessions/{sessionId}": {
+      "get": {
+        "summary": "Obtener estado de una sesión",
+        "tags": ["Sesiones"],
+        "security": [{ "ApiKeyAuth": [] }],
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "ID de la sesión"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Estado de la sesión",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "sessionId": { "type": "string" },
+                        "phoneNumber": { "type": "string" },
+                        "status": { "type": "string" },
+                        "connectedAt": { "type": "string", "format": "date-time" },
+                        "hasQR": { "type": "boolean" },
+                        "hasPairing": { "type": "boolean" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Sesión no encontrada"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Eliminar una sesión",
+        "tags": ["Sesiones"],
+        "security": [{ "ApiKeyAuth": [] }],
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sesión eliminada"
+          },
+          "404": {
+            "description": "Sesión no encontrada"
+          }
+        }
+      }
+    },
+    "/sessions/{sessionId}/status": {
+      "get": {
+        "summary": "Obtener estado detallado de conexión",
+        "tags": ["Sesiones"],
+        "security": [{ "ApiKeyAuth": [] }],
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Estado de conexión"
+          }
+        }
+      }
+    },
+    "/sessions/{sessionId}/pairing": {
+      "post": {
+        "summary": "Solicitar código de emparejamiento",
+        "tags": ["Sesiones"],
+        "security": [{ "ApiKeyAuth": [] }],
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["phone"],
+                "properties": {
+                  "phone": { "type": "string", "example": "525556614579" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Código de emparejamiento generado",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "code": { "type": "string", "example": "XXX-XXX-XXX" },
+                        "phone": { "type": "string" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sessions/{sessionId}/logout": {
+      "post": {
+        "summary": "Cerrar sesión de WhatsApp",
+        "tags": ["Sesiones"],
+        "security": [{ "ApiKeyAuth": [] }],
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sesión cerrada"
+          }
+        }
+      }
+    },
+    "/sessions/{sessionId}/send": {
+      "post": {
+        "summary": "Enviar mensaje de texto",
+        "tags": ["Mensajes"],
+        "security": [{ "ApiKeyAuth": [] }],
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["phone", "message"],
+                "properties": {
+                  "phone": { "type": "string", "example": "525556614579" },
+                  "message": { "type": "string", "example": "Hola desde la API" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Mensaje enviado"
+          }
+        }
+      }
+    },
+    "/sessions/{sessionId}/send-with-files": {
+      "post": {
+        "summary": "Enviar mensaje con archivos",
+        "tags": ["Mensajes"],
+        "security": [{ "ApiKeyAuth": [] }],
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": ["phone"],
+                "properties": {
+                  "phone": { "type": "string" },
+                  "message": { "type": "string" },
+                  "files": {
+                    "type": "array",
+                    "items": { "type": "string", "format": "binary" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Mensaje con archivos enviado"
+          }
+        }
+      }
+    },
+    "/sessions/{sessionId}/check/{phone}": {
+      "get": {
+        "summary": "Verificar si un número tiene WhatsApp",
+        "tags": ["Mensajes"],
+        "security": [{ "ApiKeyAuth": [] }],
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "phone",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Resultado de verificación",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "exists": { "type": "boolean" },
+                        "phone": { "type": "string" },
+                        "jid": { "type": "string" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sessions/{sessionId}/chats": {
+      "get": {
+        "summary": "Listar conversaciones",
+        "tags": ["Chats"],
+        "security": [{ "ApiKeyAuth": [] }],
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Lista de conversaciones"
+          }
+        }
+      }
+    },
+    "/sessions/{sessionId}/chats/{phone}": {
+      "get": {
+        "summary": "Obtener chat específico",
+        "tags": ["Chats"],
+        "security": [{ "ApiKeyAuth": [] }],
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "phone",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Datos del chat"
+          }
+        }
+      }
+    },
+    "/sessions/{sessionId}/chats/{phone}/messages": {
+      "get": {
+        "summary": "Obtener mensajes de un chat",
+        "tags": ["Chats"],
+        "security": [{ "ApiKeyAuth": [] }],
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "phone",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Mensajes del chat"
+          }
+        }
+      }
+    },
+    "/sessions/{sessionId}/download/{messageId}": {
+      "get": {
+        "summary": "Descargar archivo multimedia",
+        "tags": ["Mensajes"],
+        "security": [{ "ApiKeyAuth": [] }],
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "messageId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Archivo binario",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "ApiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+        "description": "API Key para autenticación. Disponible en auth/keys.json"
+      }
+    },
+    "schemas": {
+      "Session": {
+        "type": "object",
+        "properties": {
+          "sessionId": { "type": "string" },
+          "phoneNumber": { "type": "string", "nullable": true },
+          "status": { "type": "string", "enum": ["disconnected", "waiting_qr", "waiting_pairing", "connected"] },
+          "connectedAt": { "type": "string", "format": "date-time", "nullable": true }
+        }
+      },
+      "Chat": {
+        "type": "object",
+        "properties": {
+          "phone": { "type": "string" },
+          "name": { "type": "string" },
+          "lastMessage": { "$ref": "#/components/schemas/Message" },
+          "messageCount": { "type": "integer" }
+        }
+      },
+      "Message": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "text": { "type": "string" },
+          "timestamp": { "type": "integer", "description": "Timestamp Unix en milisegundos" },
+          "isOutgoing": { "type": "boolean" },
+          "mediaType": { "type": "string", "enum": ["image", "video", "audio", "document", "sticker"], "nullable": true },
+          "mediaThumbnail": { "type": "string", "nullable": true },
+          "mediaMimeType": { "type": "string", "nullable": true },
+          "mediaFileName": { "type": "string", "nullable": true },
+          "quotedMsg": {
+            "type": "object",
+            "nullable": true,
+            "properties": {
+              "id": { "type": "string" },
+              "text": { "type": "string" },
+              "sender": { "type": "string" }
+            }
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "example": false },
+          "error": { "type": "string" },
+          "code": { "type": "string" }
+        }
+      },
+      "ApiResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "data": { "type": "object" },
+          "error": { "type": "string" }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "Sistema",
+      "description": "Endpoints de verificación y estado del sistema"
+    },
+    {
+      "name": "Sesiones",
+      "description": "Gestión de sesiones de WhatsApp"
+    },
+    {
+      "name": "Mensajes",
+      "description": "Envío y descarga de mensajes"
+    },
+    {
+      "name": "Chats",
+      "description": "Gestión de conversaciones"
+    }
+  ]
+}
