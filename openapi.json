@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "MV WhatsApp Hub API",
-    "description": "API REST para gestión de múltiples sesiones de WhatsApp con Baileys. Permite manejar múltiples dispositivos vinculados con su propio historial de chats y sesiones.",
+    "description": "API REST para gestión de múltiples sesiones de WhatsApp con Baileys. Cada sesión tiene su propio historial de chats, sus credenciales cifradas en reposo y sus eventos de socket.\n\n**Autenticación:** dos credenciales, indistintas para el servidor. Una sesión de panel (`Authorization: Bearer <token>`) o una API Key (`X-API-Key`). Cada API key lleva su propia lista de permisos (`sessions:read`, `sessions:write`, `chats:read`, `chats:write`, `messages:send`); la sesión de panel entra siempre con `*`.\n\n**Límite de peticiones:** 100 por minuto y por credencial (o por IP si no hay credencial). Las respuestas incluyen `X-RateLimit-Limit`, `X-RateLimit-Remaining` y `X-RateLimit-Reset`.",
     "version": "1.0.0",
     "contact": {
       "name": "Soporte Fovisste"
@@ -14,7 +14,7 @@
   },
   "servers": [
     {
-      "url": "http://localhost:3000/api",
+      "url": "http://localhost:3002/api",
       "description": "Servidor de desarrollo"
     },
     {
@@ -23,27 +23,237 @@
     }
   ],
   "security": [
+    { "ApiKeyAuth": [] },
+    { "BearerAuth": [] }
+  ],
+  "tags": [
     {
-      "ApiKeyAuth": []
+      "name": "Autenticación",
+      "description": "Login del panel, sesión, revocación y token de socket"
+    },
+    {
+      "name": "Sistema",
+      "description": "Verificación y estado del servidor"
+    },
+    {
+      "name": "Sesiones",
+      "description": "Gestión de sesiones de WhatsApp"
+    },
+    {
+      "name": "Mensajes",
+      "description": "Envío y descarga de mensajes"
+    },
+    {
+      "name": "Chats",
+      "description": "Gestión de conversaciones"
     }
   ],
   "paths": {
-    "/health": {
-      "get": {
-        "summary": "Verificar estado del servidor",
-        "tags": ["Sistema"],
+    "/auth/login": {
+      "post": {
+        "summary": "Iniciar sesión en el panel",
+        "description": "Valida usuario y contraseña y devuelve un token de sesión. Es público, pero con su propio límite: 8 intentos fallidos por IP cada 15 minutos.",
+        "tags": ["Autenticación"],
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["username", "password"],
+                "properties": {
+                  "username": { "type": "string", "maxLength": 64, "example": "admin" },
+                  "password": { "type": "string", "maxLength": 200, "example": "tu_contraseña" }
+                }
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
-            "description": "Servidor saludable",
+            "description": "Sesión iniciada",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
                   "properties": {
                     "success": { "type": "boolean", "example": true },
-                    "status": { "type": "string", "example": "healthy" },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "token": { "type": "string", "description": "Token de sesión. Se manda luego como Authorization: Bearer <token>." },
+                        "username": { "type": "string", "example": "admin" },
+                        "expiresAt": { "type": "string", "format": "date-time" },
+                        "maxAgeSeconds": { "type": "integer", "example": 43200 }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Usuario o contraseña incorrectos",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Usuario o contraseña incorrectos", "code": "INVALID_CREDENTIALS" }
+              }
+            }
+          },
+          "429": {
+            "description": "Demasiados intentos fallidos desde esta IP",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Demasiados intentos. Espera unos minutos.", "code": "RATE_LIMIT_EXCEEDED" }
+              }
+            }
+          },
+          "503": {
+            "description": "No hay ningún usuario de panel dado de alta",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "El panel no tiene contraseña configurada", "code": "PANEL_NOT_CONFIGURED" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/logout": {
+      "post": {
+        "summary": "Revocar la sesión del panel",
+        "description": "Revoca el token de panel recibido y los tokens de socket que nacieron de él.",
+        "tags": ["Autenticación"],
+        "security": [{ "BearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Sesión revocada",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "success": { "type": "boolean", "example": true } }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Token de panel inválido o vencido",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Sesión inválida", "code": "INVALID_SESSION" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/me": {
+      "get": {
+        "summary": "Usuario de la credencial actual",
+        "tags": ["Autenticación"],
+        "responses": {
+          "200": {
+            "description": "Identidad de la credencial",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "example": true },
+                    "data": {
+                      "type": "object",
+                      "properties": { "username": { "type": ["string", "null"], "example": "admin" } }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Faltan credenciales o no son válidas",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Autenticación requerida", "code": "MISSING_CREDENTIALS" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/socket-token": {
+      "post": {
+        "summary": "Emitir token de Socket.IO",
+        "description": "Emite un token de corta duración (30 minutos por defecto) para conectarse a Socket.IO. Solo se puede pedir con una sesión de panel: una API key responde 403. El token viaja en el handshake (`auth.token`), nunca en la query string.",
+        "tags": ["Autenticación"],
+        "security": [{ "BearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Token emitido",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "example": true },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "token": { "type": "string" },
+                        "expiresAt": { "type": "string", "format": "date-time" },
+                        "socketUrl": { "type": "string", "example": "http://localhost:3002" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "La credencial no es una sesión de panel",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "El token de socket solo se emite para una sesión del panel", "code": "FORBIDDEN" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Verificar estado del servidor",
+        "description": "Público. Devuelve `healthy` o `degraded` (hay alguna línea caída) y el conteo de sesiones.",
+        "tags": ["Sistema"],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Estado del servidor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "example": true },
+                    "status": { "type": "string", "enum": ["healthy", "degraded"], "example": "healthy" },
                     "version": { "type": "string", "example": "1.0.0" },
                     "uptime": { "type": "number", "example": 3600 },
+                    "sessions": {
+                      "type": "object",
+                      "properties": {
+                        "total": { "type": "integer", "example": 3 },
+                        "connected": { "type": "integer", "example": 2 },
+                        "waiting": { "type": "integer", "example": 0 },
+                        "down": { "type": "integer", "example": 1 }
+                      }
+                    },
                     "timestamp": { "type": "string", "format": "date-time" }
                   }
                 }
@@ -56,6 +266,7 @@
     "/status": {
       "get": {
         "summary": "Obtener estado general de la API",
+        "description": "Requiere el permiso `sessions:read`.",
         "tags": ["Sistema"],
         "responses": {
           "200": {
@@ -65,17 +276,51 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "success": { "type": "boolean" },
+                    "success": { "type": "boolean", "example": true },
                     "data": {
                       "type": "object",
                       "properties": {
-                        "api": { "type": "object" },
-                        "sessions": { "type": "object" },
-                        "keys": { "type": "object" }
+                        "api": {
+                          "type": "object",
+                          "properties": {
+                            "name": { "type": "string", "example": "MV WhatsApp Hub API" },
+                            "version": { "type": "string", "example": "1.0.0" },
+                            "environment": { "type": "string", "example": "development" }
+                          }
+                        },
+                        "sessions": {
+                          "type": "object",
+                          "properties": {
+                            "count": { "type": "integer", "example": 3 },
+                            "list": {
+                              "type": "array",
+                              "items": {
+                                "type": "object",
+                                "properties": {
+                                  "sessionId": { "type": "string" },
+                                  "status": { "$ref": "#/components/schemas/SessionStatus" }
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "keys": {
+                          "type": "object",
+                          "properties": { "count": { "type": "integer", "example": 1 } }
+                        }
                       }
                     }
                   }
                 }
+              }
+            }
+          },
+          "403": {
+            "description": "Falta el permiso `sessions:read`",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Permiso insuficiente", "code": "FORBIDDEN" }
               }
             }
           }
@@ -85,8 +330,8 @@
     "/sessions": {
       "get": {
         "summary": "Listar todas las sesiones",
+        "description": "Requiere el permiso `sessions:read`.",
         "tags": ["Sesiones"],
-        "security": [{ "ApiKeyAuth": [] }],
         "responses": {
           "200": {
             "description": "Lista de sesiones",
@@ -95,22 +340,29 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "success": { "type": "boolean" },
-                    "data": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "properties": {
-                          "sessionId": { "type": "string" },
-                          "phoneNumber": { "type": "string" },
-                          "status": { "type": "string", "enum": ["disconnected", "waiting_qr", "waiting_pairing", "connected"] },
-                          "connectedAt": { "type": "string", "format": "date-time", "nullable": true }
-                        }
-                      }
-                    },
-                    "count": { "type": "integer" }
+                    "success": { "type": "boolean", "example": true },
+                    "data": { "type": "array", "items": { "$ref": "#/components/schemas/Session" } },
+                    "count": { "type": "integer", "example": 3 }
                   }
                 }
+              }
+            }
+          },
+          "401": {
+            "description": "Faltan credenciales o no son válidas",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Autenticación requerida", "code": "MISSING_CREDENTIALS" }
+              }
+            }
+          },
+          "403": {
+            "description": "Falta el permiso `sessions:read`",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Permiso insuficiente", "code": "FORBIDDEN" }
               }
             }
           }
@@ -118,8 +370,8 @@
       },
       "post": {
         "summary": "Crear nueva sesión",
+        "description": "Requiere el permiso `sessions:write`. Si se manda `phoneNumber`, la carpeta de credenciales de esa sesión se reinicia para forzar un emparejamiento nuevo. El id de sesión se recorta a 8 caracteres.",
         "tags": ["Sesiones"],
-        "security": [{ "ApiKeyAuth": [] }],
         "requestBody": {
           "required": false,
           "content": {
@@ -141,20 +393,20 @@
         },
         "responses": {
           "201": {
-            "description": "Sesión creada exitosamente",
+            "description": "Sesión creada",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "success": { "type": "boolean" },
+                    "success": { "type": "boolean", "example": true },
                     "data": {
                       "type": "object",
                       "properties": {
-                        "sessionId": { "type": "string" },
-                        "phoneNumber": { "type": "string" },
-                        "status": { "type": "string" },
-                        "createdAt": { "type": "string" }
+                        "sessionId": { "type": "string", "example": "abc12345" },
+                        "phoneNumber": { "type": ["string", "null"], "example": "525556614579" },
+                        "status": { "$ref": "#/components/schemas/SessionStatus" },
+                        "createdAt": { "type": "string", "format": "date-time" }
                       }
                     }
                   }
@@ -163,25 +415,31 @@
             }
           },
           "400": {
-            "description": "Error al crear sesión"
+            "description": "No se pudo crear la sesión",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "La sesión abc12345 ya existe" }
+              }
+            }
           }
         }
       }
     },
     "/sessions/{sessionId}": {
+      "parameters": [
+        {
+          "name": "sessionId",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string" },
+          "description": "ID de la sesión"
+        }
+      ],
       "get": {
         "summary": "Obtener estado de una sesión",
+        "description": "Requiere el permiso `sessions:read`.",
         "tags": ["Sesiones"],
-        "security": [{ "ApiKeyAuth": [] }],
-        "parameters": [
-          {
-            "name": "sessionId",
-            "in": "path",
-            "required": true,
-            "schema": { "type": "string" },
-            "description": "ID de la sesión"
-          }
-        ],
         "responses": {
           "200": {
             "description": "Estado de la sesión",
@@ -190,17 +448,40 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "success": { "type": "boolean" },
+                    "success": { "type": "boolean", "example": true },
+                    "data": { "$ref": "#/components/schemas/SessionDetail" }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Sesión no encontrada",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Sesión abc12345 no encontrada" }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Eliminar una sesión",
+        "description": "Requiere el permiso `sessions:write`. Cierra la línea en WhatsApp y borra sus carpetas de credenciales e historial.",
+        "tags": ["Sesiones"],
+        "responses": {
+          "200": {
+            "description": "Sesión eliminada",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "example": true },
                     "data": {
                       "type": "object",
-                      "properties": {
-                        "sessionId": { "type": "string" },
-                        "phoneNumber": { "type": "string" },
-                        "status": { "type": "string" },
-                        "connectedAt": { "type": "string", "format": "date-time" },
-                        "hasQR": { "type": "boolean" },
-                        "hasPairing": { "type": "boolean" }
-                      }
+                      "properties": { "message": { "type": "string", "example": "Sesión abc12345 eliminada" } }
                     }
                   }
                 }
@@ -208,28 +489,13 @@
             }
           },
           "404": {
-            "description": "Sesión no encontrada"
-          }
-        }
-      },
-      "delete": {
-        "summary": "Eliminar una sesión",
-        "tags": ["Sesiones"],
-        "security": [{ "ApiKeyAuth": [] }],
-        "parameters": [
-          {
-            "name": "sessionId",
-            "in": "path",
-            "required": true,
-            "schema": { "type": "string" }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Sesión eliminada"
-          },
-          "404": {
-            "description": "Sesión no encontrada"
+            "description": "Sesión no encontrada",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Sesión abc12345 no encontrada" }
+              }
+            }
           }
         }
       }
@@ -237,8 +503,8 @@
     "/sessions/{sessionId}/status": {
       "get": {
         "summary": "Obtener estado detallado de conexión",
+        "description": "Requiere el permiso `sessions:read`.",
         "tags": ["Sesiones"],
-        "security": [{ "ApiKeyAuth": [] }],
         "parameters": [
           {
             "name": "sessionId",
@@ -249,7 +515,27 @@
         ],
         "responses": {
           "200": {
-            "description": "Estado de conexión"
+            "description": "Estado de conexión",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "example": true },
+                    "data": { "$ref": "#/components/schemas/SessionDetail" }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Sesión no encontrada",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Sesión abc12345 no encontrada" }
+              }
+            }
           }
         }
       }
@@ -257,8 +543,8 @@
     "/sessions/{sessionId}/pairing": {
       "post": {
         "summary": "Solicitar código de emparejamiento",
+        "description": "Requiere el permiso `sessions:write`. Devuelve el código de 8 dígitos para vincular la línea desde el teléfono.",
         "tags": ["Sesiones"],
-        "security": [{ "ApiKeyAuth": [] }],
         "parameters": [
           {
             "name": "sessionId",
@@ -289,16 +575,34 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "success": { "type": "boolean" },
+                    "success": { "type": "boolean", "example": true },
                     "data": {
                       "type": "object",
                       "properties": {
-                        "code": { "type": "string", "example": "XXX-XXX-XXX" },
-                        "phone": { "type": "string" }
+                        "code": { "type": "string", "example": "ABCD1234" },
+                        "phone": { "type": "string", "example": "525556614579" }
                       }
                     }
                   }
                 }
+              }
+            }
+          },
+          "400": {
+            "description": "Falta el número de teléfono",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Número de teléfono requerido" }
+              }
+            }
+          },
+          "404": {
+            "description": "Sesión no encontrada",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Sesión abc12345 no encontrada" }
               }
             }
           }
@@ -308,8 +612,8 @@
     "/sessions/{sessionId}/logout": {
       "post": {
         "summary": "Cerrar sesión de WhatsApp",
+        "description": "Requiere el permiso `sessions:write`. Desvincula la línea y borra sus carpetas de credenciales e historial.",
         "tags": ["Sesiones"],
-        "security": [{ "ApiKeyAuth": [] }],
         "parameters": [
           {
             "name": "sessionId",
@@ -320,7 +624,30 @@
         ],
         "responses": {
           "200": {
-            "description": "Sesión cerrada"
+            "description": "Sesión cerrada",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "example": true },
+                    "data": {
+                      "type": "object",
+                      "properties": { "message": { "type": "string", "example": "Sesión cerrada" } }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Sesión no encontrada",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Sesión abc12345 no encontrada" }
+              }
+            }
           }
         }
       }
@@ -328,8 +655,8 @@
     "/sessions/{sessionId}/send": {
       "post": {
         "summary": "Enviar mensaje de texto",
+        "description": "Requiere el permiso `messages:send`.",
         "tags": ["Mensajes"],
-        "security": [{ "ApiKeyAuth": [] }],
         "parameters": [
           {
             "name": "sessionId",
@@ -355,7 +682,42 @@
         },
         "responses": {
           "200": {
-            "description": "Mensaje enviado"
+            "description": "Mensaje enviado",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "example": true },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "messageId": { "type": "string" },
+                        "phone": { "type": "string", "example": "525556614579" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Faltan el número o el mensaje",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Número y mensaje son requeridos" }
+              }
+            }
+          },
+          "404": {
+            "description": "Sesión no encontrada",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Sesión abc12345 no encontrada" }
+              }
+            }
           }
         }
       }
@@ -363,8 +725,8 @@
     "/sessions/{sessionId}/send-with-files": {
       "post": {
         "summary": "Enviar mensaje con archivos",
+        "description": "Requiere el permiso `messages:send`. Hasta 10 archivos de 50 MB. Se manda un archivo por mensaje: el texto de `message` sale como primer mensaje de texto y los demás archivos van sin leyenda. Los archivos subidos se borran del disco al terminar.",
         "tags": ["Mensajes"],
-        "security": [{ "ApiKeyAuth": [] }],
         "parameters": [
           {
             "name": "sessionId",
@@ -381,10 +743,11 @@
                 "type": "object",
                 "required": ["phone"],
                 "properties": {
-                  "phone": { "type": "string" },
-                  "message": { "type": "string" },
+                  "phone": { "type": "string", "example": "525556614579" },
+                  "message": { "type": "string", "description": "Leyenda del primer archivo" },
                   "files": {
                     "type": "array",
+                    "maxItems": 10,
                     "items": { "type": "string", "format": "binary" }
                   }
                 }
@@ -394,49 +757,41 @@
         },
         "responses": {
           "200": {
-            "description": "Mensaje con archivos enviado"
-          }
-        }
-      }
-    },
-    "/sessions/{sessionId}/check/{phone}": {
-      "get": {
-        "summary": "Verificar si un número tiene WhatsApp",
-        "tags": ["Mensajes"],
-        "security": [{ "ApiKeyAuth": [] }],
-        "parameters": [
-          {
-            "name": "sessionId",
-            "in": "path",
-            "required": true,
-            "schema": { "type": "string" }
-          },
-          {
-            "name": "phone",
-            "in": "path",
-            "required": true,
-            "schema": { "type": "string" }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Resultado de verificación",
+            "description": "Mensajes enviados",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "success": { "type": "boolean" },
+                    "success": { "type": "boolean", "example": true },
                     "data": {
                       "type": "object",
                       "properties": {
-                        "exists": { "type": "boolean" },
-                        "phone": { "type": "string" },
-                        "jid": { "type": "string" }
+                        "messageId": { "type": ["string", "null"], "description": "Id del primer mensaje" },
+                        "messageIds": { "type": "array", "items": { "type": "string" } },
+                        "phone": { "type": "string", "example": "525556614579" }
                       }
                     }
                   }
                 }
+              }
+            }
+          },
+          "400": {
+            "description": "Falta el número, o no hay archivo ni mensaje",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Se requiere al menos un archivo o mensaje" }
+              }
+            }
+          },
+          "404": {
+            "description": "Sesión no encontrada",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Sesión abc12345 no encontrada" }
               }
             }
           }
@@ -446,8 +801,8 @@
     "/sessions/{sessionId}/chats": {
       "get": {
         "summary": "Listar conversaciones",
+        "description": "Requiere el permiso `chats:read`. Las conversaciones se agrupan por teléfono, aunque WhatsApp las entregue con JID `@lid`.",
         "tags": ["Chats"],
-        "security": [{ "ApiKeyAuth": [] }],
         "parameters": [
           {
             "name": "sessionId",
@@ -458,7 +813,37 @@
         ],
         "responses": {
           "200": {
-            "description": "Lista de conversaciones"
+            "description": "Lista de conversaciones",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "example": true },
+                    "data": { "type": "array", "items": { "$ref": "#/components/schemas/Chat" } },
+                    "count": { "type": "integer", "example": 12 }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Falta el permiso `chats:read`",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Permiso insuficiente", "code": "FORBIDDEN" }
+              }
+            }
+          },
+          "404": {
+            "description": "Sesión no encontrada",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Sesión abc12345 no encontrada" }
+              }
+            }
           }
         }
       }
@@ -466,8 +851,8 @@
     "/sessions/{sessionId}/chats/{phone}": {
       "get": {
         "summary": "Obtener chat específico",
+        "description": "Requiere el permiso `chats:read`. Devuelve la conversación con sus mensajes.",
         "tags": ["Chats"],
-        "security": [{ "ApiKeyAuth": [] }],
         "parameters": [
           {
             "name": "sessionId",
@@ -479,12 +864,33 @@
             "name": "phone",
             "in": "path",
             "required": true,
-            "schema": { "type": "string" }
+            "schema": { "type": "string" },
+            "description": "Teléfono, o los últimos dígitos de un JID `@lid`"
           }
         ],
         "responses": {
           "200": {
-            "description": "Datos del chat"
+            "description": "Datos del chat",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "example": true },
+                    "data": { "$ref": "#/components/schemas/ChatDetail" }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Sesión o chat no encontrado",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Chat 525556614579 no encontrado" }
+              }
+            }
           }
         }
       }
@@ -492,8 +898,8 @@
     "/sessions/{sessionId}/chats/{phone}/messages": {
       "get": {
         "summary": "Obtener mensajes de un chat",
+        "description": "Requiere el permiso `chats:read`.",
         "tags": ["Chats"],
-        "security": [{ "ApiKeyAuth": [] }],
         "parameters": [
           {
             "name": "sessionId",
@@ -510,7 +916,28 @@
         ],
         "responses": {
           "200": {
-            "description": "Mensajes del chat"
+            "description": "Mensajes del chat",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "example": true },
+                    "data": { "type": "array", "items": { "$ref": "#/components/schemas/Message" } },
+                    "count": { "type": "integer", "example": 42 }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Sesión no encontrada",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Sesión abc12345 no encontrada" }
+              }
+            }
           }
         }
       }
@@ -518,8 +945,8 @@
     "/sessions/{sessionId}/download/{messageId}": {
       "get": {
         "summary": "Descargar archivo multimedia",
+        "description": "Requiere el permiso `chats:read`. El archivo se descarga de WhatsApp en el momento.",
         "tags": ["Mensajes"],
-        "security": [{ "ApiKeyAuth": [] }],
         "parameters": [
           {
             "name": "sessionId",
@@ -537,12 +964,33 @@
         "responses": {
           "200": {
             "description": "Archivo binario",
+            "headers": {
+              "Content-Disposition": {
+                "description": "Nombre del archivo adjunto",
+                "schema": { "type": "string" }
+              }
+            },
             "content": {
               "application/octet-stream": {
-                "schema": {
-                  "type": "string",
-                  "format": "binary"
-                }
+                "schema": { "type": "string", "format": "binary" }
+              }
+            }
+          },
+          "404": {
+            "description": "Sesión no encontrada",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "Sesión abc12345 no encontrada" }
+              }
+            }
+          },
+          "500": {
+            "description": "El mensaje no tiene archivo o no se pudo descargar",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "success": false, "error": "El archivo no tiene llave de descarga" }
               }
             }
           }
@@ -556,26 +1004,81 @@
         "type": "apiKey",
         "in": "header",
         "name": "X-API-Key",
-        "description": "API Key para autenticación. Disponible en auth/keys.json"
+        "description": "API Key para procesos automáticos. Solo se guarda su hash SHA-256 en `auth/keys.json`; el valor en claro queda en `secrets/api-keys.txt`. Cada llave lleva su lista de permisos."
+      },
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Token de sesión del panel, emitido por `POST /auth/login`. Solo se guarda su hash SHA-256 en `auth/panel-sessions.json`."
       }
     },
     "schemas": {
+      "SessionStatus": {
+        "type": "string",
+        "enum": [
+          "disconnected",
+          "waiting_qr",
+          "waiting_pairing",
+          "connected",
+          "reconnecting",
+          "needs_repair"
+        ]
+      },
       "Session": {
         "type": "object",
         "properties": {
-          "sessionId": { "type": "string" },
-          "phoneNumber": { "type": "string", "nullable": true },
-          "status": { "type": "string", "enum": ["disconnected", "waiting_qr", "waiting_pairing", "connected"] },
-          "connectedAt": { "type": "string", "format": "date-time", "nullable": true }
+          "sessionId": { "type": "string", "example": "abc12345" },
+          "phoneNumber": { "type": ["string", "null"], "example": "525556614579" },
+          "status": { "$ref": "#/components/schemas/SessionStatus" },
+          "connectedAt": { "type": ["string", "null"], "format": "date-time" },
+          "botPhoneNormalized": { "type": ["string", "null"] },
+          "reconnectAttempt": { "type": "integer", "example": 0 },
+          "nextReconnectAt": { "type": ["string", "null"], "format": "date-time" },
+          "lastDisconnect": { "$ref": "#/components/schemas/LastDisconnect" }
+        }
+      },
+      "SessionDetail": {
+        "type": "object",
+        "properties": {
+          "sessionId": { "type": "string", "example": "abc12345" },
+          "phoneNumber": { "type": ["string", "null"], "example": "525556614579" },
+          "status": { "$ref": "#/components/schemas/SessionStatus" },
+          "connectedAt": { "type": ["string", "null"], "format": "date-time" },
+          "hasQR": { "type": "boolean", "description": "Solo es true mientras la sesión está en `waiting_qr`." },
+          "qrCode": { "type": ["string", "null"], "description": "Solo se devuelve mientras la sesión está en `waiting_qr`." },
+          "hasPairing": { "type": "boolean", "description": "Solo es true mientras la sesión está en `waiting_pairing`." },
+          "pairingCode": { "type": ["string", "null"], "description": "Solo se devuelve mientras la sesión está en `waiting_pairing`." },
+          "reconnectAttempt": { "type": "integer", "example": 0 },
+          "nextReconnectAt": { "type": ["string", "null"], "format": "date-time" },
+          "lastDisconnect": { "$ref": "#/components/schemas/LastDisconnect" }
+        }
+      },
+      "LastDisconnect": {
+        "type": ["object", "null"],
+        "properties": {
+          "statusCode": { "type": ["integer", "null"], "example": 401 },
+          "reason": { "type": "string", "example": "401 Connection Failure" },
+          "at": { "type": "string", "format": "date-time" }
         }
       },
       "Chat": {
         "type": "object",
         "properties": {
-          "phone": { "type": "string" },
-          "name": { "type": "string" },
+          "phone": { "type": "string", "example": "525556614579" },
+          "name": { "type": "string", "example": "Ada" },
           "lastMessage": { "$ref": "#/components/schemas/Message" },
-          "messageCount": { "type": "integer" }
+          "messageCount": { "type": "integer", "example": 42 }
+        }
+      },
+      "ChatDetail": {
+        "type": "object",
+        "properties": {
+          "phone": { "type": "string", "example": "525556614579" },
+          "name": { "type": "string", "example": "Ada" },
+          "timestamp": { "type": "integer", "description": "Timestamp Unix en milisegundos" },
+          "lastMessage": { "$ref": "#/components/schemas/Message" },
+          "messageCount": { "type": "integer", "example": 42 },
+          "messages": { "type": "array", "items": { "$ref": "#/components/schemas/Message" } }
         }
       },
       "Message": {
@@ -584,56 +1087,55 @@
           "id": { "type": "string" },
           "text": { "type": "string" },
           "timestamp": { "type": "integer", "description": "Timestamp Unix en milisegundos" },
+          "waTimestamp": { "type": "integer", "description": "Timestamp original de WhatsApp, en segundos" },
           "isOutgoing": { "type": "boolean" },
-          "mediaType": { "type": "string", "enum": ["image", "video", "audio", "document", "sticker"], "nullable": true },
-          "mediaThumbnail": { "type": "string", "nullable": true },
-          "mediaMimeType": { "type": "string", "nullable": true },
-          "mediaFileName": { "type": "string", "nullable": true },
+          "jid": { "type": "string", "description": "JID original de WhatsApp. Puede terminar en `@lid`." },
+          "senderPhone": { "type": ["string", "null"] },
+          "mediaType": {
+            "type": ["string", "null"],
+            "enum": ["image", "video", "audio", "document", "sticker", null]
+          },
+          "mediaMimeType": { "type": ["string", "null"] },
+          "mediaThumbnail": { "type": ["string", "null"], "description": "Miniatura en base64" },
+          "mediaFileName": { "type": ["string", "null"] },
+          "mediaFileLength": { "type": ["integer", "null"] },
           "quotedMsg": {
-            "type": "object",
-            "nullable": true,
+            "type": ["object", "null"],
             "properties": {
               "id": { "type": "string" },
               "text": { "type": "string" },
               "sender": { "type": "string" }
             }
           }
-        }
+        },
+        "description": "La API nunca expone `mediaKey`, `mediaUrl` ni `mediaDirectPath`: para bajar el archivo usa `GET /sessions/{sessionId}/download/{messageId}`."
       },
       "Error": {
         "type": "object",
         "properties": {
           "success": { "type": "boolean", "example": false },
           "error": { "type": "string" },
-          "code": { "type": "string" }
-        }
-      },
-      "ApiResponse": {
-        "type": "object",
-        "properties": {
-          "success": { "type": "boolean" },
-          "data": { "type": "object" },
-          "error": { "type": "string" }
+          "code": {
+            "type": "string",
+            "enum": [
+              "MISSING_CREDENTIALS",
+              "INVALID_API_KEY",
+              "INVALID_SESSION",
+              "INVALID_CREDENTIALS",
+              "PANEL_NOT_CONFIGURED",
+              "FORBIDDEN",
+              "RATE_LIMIT_EXCEEDED",
+              "VALIDATION_ERROR",
+              "FILE_TOO_LARGE",
+              "CSRF_ERROR",
+              "NOT_FOUND",
+              "INTERNAL_ERROR",
+              "ERROR"
+            ]
+          },
+          "retryAfter": { "type": "integer", "description": "Segundos hasta la próxima ventana, en las respuestas 429" }
         }
       }
     }
-  },
-  "tags": [
-    {
-      "name": "Sistema",
-      "description": "Endpoints de verificación y estado del sistema"
-    },
-    {
-      "name": "Sesiones",
-      "description": "Gestión de sesiones de WhatsApp"
-    },
-    {
-      "name": "Mensajes",
-      "description": "Envío y descarga de mensajes"
-    },
-    {
-      "name": "Chats",
-      "description": "Gestión de conversaciones"
-    }
-  ]
+  }
 }

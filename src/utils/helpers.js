@@ -46,6 +46,17 @@ export function formatTimestamp(timestamp) {
   return timestamp ? (timestamp * 1000 || timestamp) : Date.now();
 }
 
+const PRIVATE_MESSAGE_FIELDS = ['mediaKey', 'mediaUrl', 'mediaDirectPath'];
+
+export function toPublicMessage(message) {
+  if (!message || typeof message !== 'object') return message;
+  const copy = { ...message };
+  for (const field of PRIVATE_MESSAGE_FIELDS) {
+    delete copy[field];
+  }
+  return copy;
+}
+
 export function createApiResponse(success, data = null, error = null) {
   const response = { success };
   if (data) response.data = data;

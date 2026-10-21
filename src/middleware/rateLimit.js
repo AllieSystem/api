@@ -22,7 +22,11 @@ export function rateLimitMiddleware(options = {}) {
     if (count === 1) {
       requestCounts.set(key, count, windowMs / 1000);
     } else {
-      requestCounts.set(key, count);
+      const expiresAt = requestCounts.getTtl(key);
+      const remainingSec = expiresAt
+        ? Math.max(1, Math.ceil((expiresAt - Date.now()) / 1000))
+        : Math.ceil(windowMs / 1000);
+      requestCounts.set(key, count, remainingSec);
     }
 
     const remaining = Math.max(0, maxRequests - count);

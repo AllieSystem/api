@@ -9,7 +9,14 @@ import { logger } from '../utils/logger.js';
 import config from '../config/config.js';
 
 const router = Router();
-const sessionManager = new SessionManager();
+let managerInstance = null;
+
+export function getSessionManager() {
+  if (!managerInstance) {
+    managerInstance = new SessionManager();
+  }
+  return managerInstance;
+}
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -30,16 +37,12 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 },
 });
 
-export function getSessionManager() {
-  return sessionManager;
-}
-
 export function initSessionRoutes(app) {
   app.use('/sessions', router);
 }
 
 router.get('/', asyncHandler(async (req, res) => {
-  const sessions = sessionManager.listSessions();
+  const sessions = getSessionManager().listSessions();
   res.json({
     success: true,
     data: sessions,
@@ -52,7 +55,7 @@ router.post('/', asyncHandler(async (req, res) => {
 
   logger.info({ phoneNumber, options }, 'Creating session');
   try {
-    const result = await sessionManager.createSession(phoneNumber, options || {});
+    const result = await getSessionManager().createSession(phoneNumber, options || {});
     logger.info({ sessionId: result.sessionId }, 'Session created successfully');
     res.status(201).json({
       success: true,
@@ -67,11 +70,11 @@ router.post('/', asyncHandler(async (req, res) => {
 router.get('/:id', asyncHandler(async (req, res) => {
   const { id } = req.params;
 
-  if (!sessionManager.sessionExists(id)) {
+  if (!getSessionManager().sessionExists(id)) {
     throw createError(`Sesión ${id} no encontrada`, 404);
   }
 
-  const status = sessionManager.getSessionStatus(id);
+  const status = getSessionManager().getSessionStatus(id);
   res.json({
     success: true,
     data: status,
@@ -81,11 +84,11 @@ router.get('/:id', asyncHandler(async (req, res) => {
 router.delete('/:id', asyncHandler(async (req, res) => {
   const { id } = req.params;
 
-  if (!sessionManager.sessionExists(id)) {
+  if (!getSessionManager().sessionExists(id)) {
     throw createError(`Sesión ${id} no encontrada`, 404);
   }
 
-  const result = await sessionManager.deleteSession(id);
+  const result = await getSessionManager().deleteSession(id);
   res.json({
     success: true,
     data: result,
@@ -95,11 +98,11 @@ router.delete('/:id', asyncHandler(async (req, res) => {
 router.get('/:id/status', asyncHandler(async (req, res) => {
   const { id } = req.params;
 
-  if (!sessionManager.sessionExists(id)) {
+  if (!getSessionManager().sessionExists(id)) {
     throw createError(`Sesión ${id} no encontrada`, 404);
   }
 
-  const status = sessionManager.getSessionStatus(id);
+  const status = getSessionManager().getSessionStatus(id);
   res.json({
     success: true,
     data: status,
@@ -110,7 +113,7 @@ router.post('/:id/pairing', asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { phone } = req.body || {};
 
-  if (!sessionManager.sessionExists(id)) {
+  if (!getSessionManager().sessionExists(id)) {
     throw createError(`Sesión ${id} no encontrada`, 404);
   }
 
@@ -118,7 +121,7 @@ router.post('/:id/pairing', asyncHandler(async (req, res) => {
     throw createError('Número de teléfono requerido');
   }
 
-  const code = await sessionManager.requestPairingCode(id, phone);
+  const code = await getSessionManager().requestPairingCode(id, phone);
   res.json({
     success: true,
     data: { code, phone },
@@ -128,11 +131,11 @@ router.post('/:id/pairing', asyncHandler(async (req, res) => {
 router.post('/:id/logout', asyncHandler(async (req, res) => {
   const { id } = req.params;
 
-  if (!sessionManager.sessionExists(id)) {
+  if (!getSessionManager().sessionExists(id)) {
     throw createError(`Sesión ${id} no encontrada`, 404);
   }
 
-  const result = await sessionManager.logoutSession(id);
+  const result = await getSessionManager().logoutSession(id);
   res.json({
     success: true,
     data: result,
@@ -143,7 +146,7 @@ router.post('/:id/send', asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { phone, message } = req.body || {};
 
-  if (!sessionManager.sessionExists(id)) {
+  if (!getSessionManager().sessionExists(id)) {
     throw createError(`Sesión ${id} no encontrada`, 404);
   }
 
@@ -151,7 +154,7 @@ router.post('/:id/send', asyncHandler(async (req, res) => {
     throw createError('Número y mensaje son requeridos');
   }
 
-  const result = await sessionManager.sendMessage(id, phone, message);
+  const result = await getSessionManager().sendMessage(id, phone, message);
   res.json({
     success: true,
     data: result,
@@ -163,7 +166,7 @@ router.post('/:id/send-with-files', upload.array('files', 10), asyncHandler(asyn
   const { phone, message } = req.body || {};
   const files = req.files || [];
 
-  if (!sessionManager.sessionExists(id)) {
+  if (!getSessionManager().sessionExists(id)) {
     throw createError(`Sesión ${id} no encontrada`, 404);
   }
 
@@ -175,7 +178,7 @@ router.post('/:id/send-with-files', upload.array('files', 10), asyncHandler(asyn
     throw createError('Se requiere al menos un archivo o mensaje');
   }
 
-  const result = await sessionManager.sendMessageWithFiles(id, phone, message || '', files);
+  const result = await getSessionManager().sendMessageWithFiles(id, phone, message || '', files);
   res.json({
     success: true,
     data: result,
@@ -195,11 +198,11 @@ router.post('/:id/send-with-files', upload.array('files', 10), asyncHandler(asyn
 router.get('/:id/check/:phone', asyncHandler(async (req, res) => {
   const { id, phone } = req.params;
 
-  if (!sessionManager.sessionExists(id)) {
+  if (!getSessionManager().sessionExists(id)) {
     throw createError(`Sesión ${id} no encontrada`, 404);
   }
 
-  const result = await sessionManager.checkNumber(id, phone);
+  const result = await getSessionManager().checkNumber(id, phone);
   res.json({
     success: true,
     data: result,
@@ -209,11 +212,11 @@ router.get('/:id/check/:phone', asyncHandler(async (req, res) => {
 router.get('/:id/chats', asyncHandler(async (req, res) => {
   const { id } = req.params;
 
-  if (!sessionManager.sessionExists(id)) {
+  if (!getSessionManager().sessionExists(id)) {
     throw createError(`Sesión ${id} no encontrada`, 404);
   }
 
-  const chats = sessionManager.getChats(id);
+  const chats = getSessionManager().getChats(id);
   res.json({
     success: true,
     data: chats,
@@ -224,11 +227,11 @@ router.get('/:id/chats', asyncHandler(async (req, res) => {
 router.get('/:id/chats/:phone', asyncHandler(async (req, res) => {
   const { id, phone } = req.params;
 
-  if (!sessionManager.sessionExists(id)) {
+  if (!getSessionManager().sessionExists(id)) {
     throw createError(`Sesión ${id} no encontrada`, 404);
   }
 
-  const chat = sessionManager.getChat(id, phone);
+  const chat = getSessionManager().getChat(id, phone);
   if (!chat) {
     throw createError(`Chat ${phone} no encontrado`, 404);
   }
@@ -242,11 +245,11 @@ router.get('/:id/chats/:phone', asyncHandler(async (req, res) => {
 router.get('/:id/chats/:phone/messages', asyncHandler(async (req, res) => {
   const { id, phone } = req.params;
 
-  if (!sessionManager.sessionExists(id)) {
+  if (!getSessionManager().sessionExists(id)) {
     throw createError(`Sesión ${id} no encontrada`, 404);
   }
 
-  const messages = sessionManager.getChatMessages(id, phone);
+  const messages = getSessionManager().getChatMessages(id, phone);
   res.json({
     success: true,
     data: messages,
@@ -257,13 +260,13 @@ router.get('/:id/chats/:phone/messages', asyncHandler(async (req, res) => {
 router.get('/:id/download/:messageId', asyncHandler(async (req, res) => {
   const { id, messageId } = req.params;
 
-  if (!sessionManager.sessionExists(id)) {
+  if (!getSessionManager().sessionExists(id)) {
     throw createError(`Sesión ${id} no encontrada`, 404);
   }
 
-  const media = await sessionManager.downloadMedia(id, messageId);
+  const media = await getSessionManager().downloadMedia(id, messageId);
 
-  const safeFileName = media.fileName.replace(/"/g, '""');
+  const safeFileName = String(media.fileName || 'archivo').replace(/[\r\n"]/g, '');
   res.setHeader('Content-Type', media.mimeType || 'application/octet-stream');
   res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}"`);
   res.send(media.buffer);

@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import config from '../config/config.js';
+import { decryptString, writeEncryptedFileSync } from './secrets.js';
 
 export function createAuthFolder(sessionId) {
   const authDir = path.join(config.auth.dir, sessionId);
@@ -47,7 +48,7 @@ export function saveChats(sessionId, chatsMap) {
   try {
     const chatsFile = getChatsFile(sessionId);
     const chatsArray = Array.from(chatsMap.values());
-    fs.writeFileSync(chatsFile, JSON.stringify(chatsArray, null, 2), 'utf8');
+    writeEncryptedFileSync(chatsFile, JSON.stringify(chatsArray));
     return true;
   } catch (error) {
     console.error(`Error saving chats for session ${sessionId}:`, error.message);
@@ -56,16 +57,27 @@ export function saveChats(sessionId, chatsMap) {
 }
 
 export function loadChats(sessionId) {
-  try {
-    const chatsFile = getChatsFile(sessionId);
-    if (fs.existsSync(chatsFile)) {
-      const data = fs.readFileSync(chatsFile, 'utf8');
-      return new Map(JSON.parse(data).map(chat => [chat.phone, chat]));
+  const chatsFile = getChatsFile(sessionId);
+  if (!fs.existsSync(chatsFile)) return new Map();
+
+  const raw = fs.readFileSync(chatsFile, 'utf8');
+  const parsed = JSON.parse(raw);
+  let chats = parsed;
+
+  if (parsed && parsed.whub === 1) {
+    const plain = decryptString(parsed);
+    if (!plain) {
+      throw new Error(`No se pudo descifrar el historial de ${sessionId}`);
     }
-  } catch (error) {
-    console.error(`Error loading chats for session ${sessionId}:`, error.message);
+    chats = JSON.parse(plain);
+  } else if (Array.isArray(parsed)) {
+    writeEncryptedFileSync(chatsFile, JSON.stringify(parsed));
+  } else {
+    throw new Error(`Historial inválido para ${sessionId}`);
   }
-  return new Map();
+
+  if (!Array.isArray(chats)) return new Map();
+  return new Map(chats.map((chat) => [chat.phone, chat]));
 }
 
 export function ensureDir(dir) {

@@ -1,7 +1,8 @@
 import { WhatsAppSession } from './WhatsAppSession.js';
 import { createAuthFolder, createDataFolder, deleteSessionFolders, saveChats, loadChats } from '../utils/storage.js';
-import { generateSessionId, createApiResponse } from '../utils/helpers.js';
+import { generateSessionId, createApiResponse, toPublicMessage } from '../utils/helpers.js';
 import { logger } from '../utils/logger.js';
+import config from '../config/config.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -9,9 +10,18 @@ export class SessionManager {
   constructor() {
     this.sessions = new Map();
     this.io = null;
-    this.sessionsMetaFile = './data/sessions_meta.json';
-    // Restaurar sesiones al arrancar
-    this._restoreSessionsOnStartup();
+    this.sessionsMetaFile = path.join(config.data.dir, 'sessions_meta.json');
+    this._restoreSessionsOnStartup().finally(() => {
+      this._watchLines().catch((error) => {
+        logger.warn(`No se pudo revisar las líneas: ${error.message}`);
+      });
+    });
+    this._watchdog = setInterval(() => {
+      this._watchLines().catch((error) => {
+        logger.warn(`No se pudo revisar las líneas: ${error.message}`);
+      });
+    }, 60_000);
+    this._watchdog.unref?.();
   }
 
   setSocketIO(io) {
@@ -57,7 +67,10 @@ export class SessionManager {
 
     logger.info(`Creating new session: ${sessionId}, phone: ${phoneNumber}`);
 
-    const session = new WhatsAppSession(sessionId, phoneNumber, options);
+    const session = new WhatsAppSession(sessionId, phoneNumber, {
+      ...options,
+      freshAuth: Boolean(phoneNumber),
+    });
     
     if (this.io) {
       session.setSocketIO(this.io);
@@ -110,6 +123,9 @@ export class SessionManager {
       status: session.status,
       connectedAt: session.connectedAt,
       botPhoneNormalized: session.botPhoneNormalized,
+      reconnectAttempt: session.reconnectAttempt || 0,
+      nextReconnectAt: session.nextReconnectAt || null,
+      lastDisconnect: session.lastDisconnect || null,
     }));
   }
 
@@ -154,7 +170,16 @@ export class SessionManager {
     if (!session) {
       throw new Error(`Sesión ${sessionId} no encontrada`);
     }
-    return session.getChat(phone);
+    const chat = session.getChat(phone);
+    if (!chat) return null;
+    return {
+      phone: chat.phone,
+      name: chat.name,
+      timestamp: chat.timestamp,
+      lastMessage: toPublicMessage(chat.lastMessage),
+      messageCount: chat.messages?.length || 0,
+      messages: (chat.messages || []).map(toPublicMessage),
+    };
   }
 
   getChatMessages(sessionId, phone) {
@@ -162,7 +187,7 @@ export class SessionManager {
     if (!session) {
       throw new Error(`Sesión ${sessionId} no encontrada`);
     }
-    return session.getChatMessages(phone);
+    return session.getChatMessages(phone).map(toPublicMessage);
   }
 
   async downloadMedia(sessionId, messageId) {
@@ -178,7 +203,57 @@ export class SessionManager {
     return { success: true, message: 'Sesión cerrada' };
   }
 
+  _lineNeedsAlert(session) {
+    return session.status === 'needs_repair'
+      || session.status === 'failed'
+      || (session.status === 'reconnecting' && session.reconnectAttempt >= 5);
+  }
+
+  async _watchLines() {
+    const tasks = [];
+    for (const session of this.sessions.values()) {
+      if (!this._lineNeedsAlert(session)) {
+        session._alertSignature = '';
+        continue;
+      }
+      const signature = `${session.status}:${session.reconnectAttempt}:${session.lastDisconnect?.statusCode || ''}`;
+      if (session._alertSignature === signature) continue;
+      session._alertSignature = signature;
+      logger.error({
+        sessionId: session.sessionId,
+        status: session.status,
+        attempt: session.reconnectAttempt,
+        lastDisconnect: session.lastDisconnect,
+      }, 'La línea de WhatsApp no está activa');
+      tasks.push(this._notifyDown(session));
+    }
+    await Promise.all(tasks);
+  }
+
+  async _notifyDown(session) {
+    const url = process.env.ALERT_WEBHOOK_URL;
+    if (!url) return;
+    try {
+      await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          sessionId: session.sessionId,
+          status: session.status,
+          attempt: session.reconnectAttempt || 0,
+          at: new Date().toISOString(),
+        }),
+      });
+    } catch (error) {
+      logger.warn(`No se pudo enviar la alerta: ${error.message}`);
+    }
+  }
+
   async shutdown() {
+    if (this._watchdog) {
+      clearInterval(this._watchdog);
+      this._watchdog = null;
+    }
     logger.info('Shutting down all sessions...');
     const closePromises = [];
     
@@ -203,7 +278,7 @@ export class SessionManager {
     };
 
     try {
-      const dataDir = './data';
+      const dataDir = path.dirname(this.sessionsMetaFile);
       if (!fs.existsSync(dataDir)) {
         fs.mkdirSync(dataDir, { recursive: true });
       }

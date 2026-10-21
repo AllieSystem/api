@@ -13,7 +13,10 @@ import { logger, logApiRequest } from './utils/logger.js';
 import { ensureBaseDirs } from './utils/storage.js';
 import { authMiddleware, rateLimitMiddleware, errorHandler, notFoundHandler } from './middleware/index.js';
 import { getSessionManager } from './routes/sessions.js';
-import { createApiKey, loadKeys } from './middleware/auth.js';
+import { ensurePanelUser, hasPermission, loadKeys, requireRequestPermission } from './middleware/auth.js';
+import { socketAuthMiddleware } from './middleware/socketAuth.js';
+import authRouter, { publicAuthRouter } from './routes/auth.js';
+import { loadEncryptionKey } from './utils/secrets.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -23,7 +26,7 @@ const server = createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: config.cors.origin,
+    origin: config.cors.origins,
     methods: ['GET', 'POST'],
     credentials: true
   },
@@ -34,8 +37,32 @@ const io = new Server(server, {
 });
 
 ensureBaseDirs();
+loadEncryptionKey();
+ensurePanelUser();
+if (config.cors.origins.length === 0) {
+  logger.warn('CORS sin orígenes permitidos. Define CORS_ORIGIN con el origen exacto del panel.');
+}
 
-app.use(cors(config.cors));
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+});
+
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || config.cors.origins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(null, false);
+  },
+  methods: config.cors.methods,
+  allowedHeaders: config.cors.allowedHeaders,
+  credentials: true,
+}));
 app.use(express.json({ limit: config.app.maxRequestSize }));
 app.use(express.urlencoded({ extended: true, limit: config.app.maxRequestSize }));
 
@@ -44,23 +71,45 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get('/api/health', (req, res) => {
+app.get('/api/health', (_req, res) => {
+  const sessions = getSessionManager().listSessions();
+  const counts = { total: sessions.length, connected: 0, waiting: 0, down: 0 };
+  for (const session of sessions) {
+    if (session.status === 'connected') counts.connected += 1;
+    else if (session.status === 'waiting_qr' || session.status === 'waiting_pairing') counts.waiting += 1;
+    else counts.down += 1;
+  }
   res.json({
     success: true,
-    status: 'healthy',
+    status: counts.down > 0 ? 'degraded' : 'healthy',
     version: config.app.version,
     uptime: process.uptime(),
+    sessions: counts,
     timestamp: new Date().toISOString(),
   });
 });
 
+app.use('/api/auth', publicAuthRouter);
 app.use('/api', authMiddleware);
 app.use('/api', rateLimitMiddleware({
   maxRequests: config.rateLimit.maxRequests,
   windowMs: config.rateLimit.windowMs,
 }));
 
+app.use('/api/auth', authRouter);
+
+if (process.env.TRUST_PROXY === '1') {
+  app.set('trust proxy', 1);
+}
+
 app.get('/api/status', (req, res) => {
+  if (!hasPermission(req.principal, 'sessions:read')) {
+    return res.status(403).json({
+      success: false,
+      error: 'Permiso insuficiente',
+      code: 'FORBIDDEN',
+    });
+  }
   const sessionManager = getSessionManager();
   const sessions = sessionManager.listSessions();
   const keysData = loadKeys();
@@ -105,10 +154,16 @@ io.on('error', (error) => {
   logger.error({ error: error.message }, 'Socket.io Server Error');
 });
 
+io.use(socketAuthMiddleware);
+
 io.on('connection', (socket) => {
   logger.info({ socketId: socket.id, ip: socket.handshake.address }, 'Socket connected');
 
   socket.on('join_session', (sessionId) => {
+    if (!socket.data.user) {
+      socket.emit('error', { message: 'No autenticado' });
+      return;
+    }
     if (sessionManager.sessionExists(sessionId)) {
       socket.join(sessionId);
       socket.sessionId = sessionId;
@@ -138,6 +193,8 @@ io.on('connection', (socket) => {
 });
 
 const sessionPattern = /^\/session\/([^\/]+)$/;
+io.of(sessionPattern).use(socketAuthMiddleware);
+
 io.of(sessionPattern).on('connection', (socket) => {
   const match = socket.nsp.name.match(sessionPattern);
   const sessionId = match ? match[1] : null;
@@ -202,6 +259,7 @@ process.on('SIGINT', async () => {
 
 function initSessionRoutes(app, sessionManager) {
   const sessionsRouter = express.Router();
+  sessionsRouter.use(requireRequestPermission);
 
   const uploadStorage = multer.diskStorage({
     destination: (req, file, cb) => {
@@ -211,7 +269,10 @@ function initSessionRoutes(app, sessionManager) {
     },
     filename: (req, file, cb) => {
       const uniqueSuffix = crypto.randomBytes(8).toString('hex');
-      cb(null, uniqueSuffix + '-' + file.originalname);
+      const baseName = path.basename(file.originalname || 'archivo')
+        .replace(/[^a-zA-Z0-9._-]/g, '_')
+        .slice(0, 80) || 'archivo';
+      cb(null, `${uniqueSuffix}-${baseName}`);
     },
   });
   const upload = multer({ storage: uploadStorage, limits: { fileSize: 50 * 1024 * 1024 } });
@@ -335,6 +396,22 @@ function initSessionRoutes(app, sessionManager) {
     res.json({ success: true, data: chat });
   });
 
+  sessionsRouter.get('/:id/download/:messageId', async (req, res) => {
+    const { id, messageId } = req.params;
+    if (!sessionManager.sessionExists(id)) {
+      return res.status(404).json({ success: false, error: `Sesión ${id} no encontrada` });
+    }
+    try {
+      const media = await sessionManager.downloadMedia(id, messageId);
+      const safeFileName = String(media.fileName || 'archivo').replace(/[\r\n"]/g, '');
+      res.setHeader('Content-Type', media.mimeType || 'application/octet-stream');
+      res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}"`);
+      res.send(media.buffer);
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+
   sessionsRouter.get('/:id/chats/:phone/messages', (req, res) => {
     const { id, phone } = req.params;
     if (!sessionManager.sessionExists(id)) {
@@ -388,17 +465,9 @@ server.listen(PORT, HOST, () => {
   Version:    ${config.app.version.padEnd(32)}
   Env:       ${config.app.env.padEnd(32)}
   URL:       http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}
-  API Key:   ${loadKeys().keys[0]?.key?.substring(0, 20) + '...' || 'N/A'.padEnd(20)}
+  API keys:  ${String(loadKeys().keys.filter((entry) => entry.active).length).padEnd(32)}
 
   `);
-
-  const apiKey = loadKeys().keys[0]?.key;
-  if (apiKey) {
-    logger.info(`
-  API Key (guardala en un lugar seguro):
-  ${apiKey}
-    `);
-  }
 });
 
 export { app, server, io };

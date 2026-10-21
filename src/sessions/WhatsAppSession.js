@@ -1,11 +1,17 @@
-import { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, downloadMediaMessage, extensionForMediaMessage, Browsers } from '@whiskeysockets/baileys';
-import { Boom } from '@hapi/boom';
+import fs from 'fs';
+import path from 'path';
+import { makeWASocket, fetchLatestBaileysVersion, downloadMediaMessage, extensionForMediaMessage, extractMessageContent, proto } from '@whiskeysockets/baileys';
+import { useEncryptedAuthState } from '../utils/encryptedAuthState.js';
+import { classifyClose, reconnectDelayMs } from './connectionPolicy.js';
 import pino from 'pino';
 import NodeCache from 'node-cache';
 import WebSocket from 'ws';
 import config from '../config/config.js';
 import { createAuthFolder, createDataFolder, loadChats, saveChats, deleteSessionFolders, getAuthFolder } from '../utils/storage.js';
-import { normalizePhoneKey, extractPhoneFromJid, formatTimestamp, normalizePhone } from '../utils/helpers.js';
+import { normalizePhoneKey, extractPhoneFromJid, formatTimestamp, normalizePhone, toPublicMessage } from '../utils/helpers.js';
+import { digits, findConversation, groupConversations, toChatSummary, upsertChatMessage } from '../utils/conversations.js';
+import { mediaKeyToBuffer, normalizeFileLength, normalizeMediaKey, thumbnailToBase64 } from '../utils/media.js';
+import { buildOutgoingContent } from '../utils/outgoingMedia.js';
 import { logger as mainLogger, createSessionLogger } from '../utils/logger.js';
 
 const msgRetryCounterCache = new NodeCache();
@@ -28,8 +34,16 @@ export class WhatsAppSession {
     this.options = options;
     this.saveInterval = null;
     this.connectedAt = null;
-    this.connectionAttempts = 0;
-    this.maxConnectionAttempts = 3;
+    this.reconnectAttempt = 0;
+    this.nextReconnectAt = null;
+    this.lastDisconnect = null;
+    this.socketGeneration = 0;
+    this._closeHandledGeneration = -1;
+    this.reconnectTimer = null;
+    this._connectPromise = null;
+    this._authResetDone = false;
+    this._dirty = false;
+    this._saveChain = Promise.resolve();
   }
 
   setSocketIO(io) {
@@ -61,23 +75,37 @@ export class WhatsAppSession {
   }
 
   async connect() {
+    if (this._connectPromise) return this._connectPromise;
+    this._connectPromise = this._connectBody();
+    try {
+      return await this._connectPromise;
+    } finally {
+      this._connectPromise = null;
+    }
+  }
+
+  async _connectBody() {
     createAuthFolder(this.sessionId);
     createDataFolder(this.sessionId);
 
-    this.chats = loadChats(this.sessionId) || new Map();
+    if (this._dirty) this.flushChats();
+    if (!this.chats || this.chats.size === 0) {
+      this.chats = loadChats(this.sessionId) || new Map();
+      this.consolidateChats();
+    }
 
     const authDir = getAuthFolder(this.sessionId);
 
-    if (this.phoneNumber) {
+    if (this.options.freshAuth && !this._authResetDone) {
+      this._authResetDone = true;
       const fs = await import('fs');
       if (fs.existsSync(authDir)) {
         fs.rmSync(authDir, { recursive: true, force: true });
-        this.logger.info('Cleared auth folder for pairing code flow');
+        this.logger.info('Carpeta de auth reiniciada para un emparejamiento nuevo');
       }
     }
 
-    const { state, saveCreds } = await useMultiFileAuthState(authDir);
-    
+    const { state, saveCreds } = await useEncryptedAuthState(authDir);
     let version;
     try {
       const latest = await fetchLatestBaileysVersion();
@@ -87,6 +115,10 @@ export class WhatsAppSession {
       version = [2, 3000, 1015901307]; // Fallback
       this.logger.warn({ version, error: e.message }, 'Failed to fetch latest Baileys version, using fallback');
     }
+
+    this.socketGeneration += 1;
+    const generation = this.socketGeneration;
+    this._retireSocket();
 
     this.sock = makeWASocket({
       version,
@@ -99,18 +131,16 @@ export class WhatsAppSession {
       printQRInTerminal: false,
       browser: ['Ubuntu', 'Chrome', '20.0.04'],
       syncFullHistory: false,
+      shouldSyncHistoryMessage: (message) => message?.syncType === proto.HistorySync.HistorySyncType.ON_DEMAND,
       fireInitQueries: true,
       emitOwnEvents: true,
-      getMessage: async (key) => {
-        const msg = this.messageStore.get(key.id);
-        if (msg) return msg.message;
-        return { conversation: 'Mensaje reenviado automáticamente' };
-      },
+      getMessage: async (key) => this.messageStore.get(key.id)?.message,
     });
 
     this.sock.ev.on('creds.update', saveCreds);
 
     this.sock.ev.on('connection.update', (update) => {
+      if (generation !== this.socketGeneration) return;
       this._handleConnectionUpdate(update);
     });
 
@@ -151,9 +181,60 @@ export class WhatsAppSession {
     return this;
   }
 
+  _retireSocket() {
+    const previous = this.sock;
+    this.sock = null;
+    if (!previous) return;
+    try {
+      previous.ev?.removeAllListeners('connection.update');
+      previous.ev?.removeAllListeners('creds.update');
+      previous.ev?.removeAllListeners('messages.upsert');
+      previous.ev?.removeAllListeners('messaging-history.set');
+      previous.ev?.removeAllListeners('message-receipt.update');
+    } catch (error) {
+      this.logger.warn(`No se pudieron quitar listeners: ${error.message}`);
+    }
+    try {
+      previous.end(undefined);
+    } catch (error) {
+      this.logger.warn(`No se pudo cerrar el socket anterior: ${error.message}`);
+    }
+  }
+
+  _clearReconnectTimer() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+
+  _scheduleReconnect(delay) {
+    this._clearReconnectTimer();
+    const generation = this.socketGeneration;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (generation !== this.socketGeneration) return;
+      if (this.status === 'needs_repair' || this.status === 'connected') return;
+      this.connect().catch((error) => {
+        this.logger.error(`Reconexión falló: ${error.message}`);
+        if (this.status === 'needs_repair') return;
+        this.reconnectAttempt += 1;
+        const nextDelay = reconnectDelayMs(this.reconnectAttempt);
+        this.nextReconnectAt = new Date(Date.now() + nextDelay).toISOString();
+        this.status = 'reconnecting';
+        this._scheduleReconnect(nextDelay);
+      });
+    }, delay);
+    this.reconnectTimer.unref?.();
+  }
+
   _handleConnectionUpdate(update) {
     const { connection, lastDisconnect, qr, pairingCode } = update;
-    this.logger.debug({ update }, 'Connection update received');
+    this.logger.debug({
+      connection,
+      hasQr: Boolean(qr),
+      hasPairingCode: Boolean(pairingCode),
+    }, 'Connection update received');
 
     if (pairingCode) {
       this.pairingCode = pairingCode;
@@ -172,37 +253,40 @@ export class WhatsAppSession {
     }
 
     if (connection === 'close') {
-      const boomError = new Boom(lastDisconnect?.error);
-      const reason = boomError?.data?.DISCONNECT_REASON || lastDisconnect?.error?.message || 'Unknown reason';
-      const statusCode = boomError?.output?.statusCode || lastDisconnect?.error?.output?.statusCode;
+      if (this._closeHandledGeneration === this.socketGeneration) return;
+      this._closeHandledGeneration = this.socketGeneration;
 
-      this.logger.warn({ reason, statusCode, error: lastDisconnect?.error }, 'Connection closed');
+      const source = lastDisconnect?.error;
+      const statusCode = source?.output?.statusCode || source?.data?.statusCode;
+      const reason = [source?.data?.reason, source?.message].filter(Boolean).join(' ');
+      const decision = classifyClose({ statusCode, reason });
+      this.lastDisconnect = {
+        statusCode: statusCode || null,
+        reason: String(reason).slice(0, 180),
+        at: new Date().toISOString(),
+      };
+      this._retireSocket();
 
-      if (statusCode === 405) {
-        this.connectionAttempts++;
-        if (this.connectionAttempts >= this.maxConnectionAttempts) {
-          this.logger.error('Max connection attempts reached, giving up');
-          this.status = 'failed';
-          this._emitToSession('status', this.status);
-          return;
-        }
-        this.logger.info({ attempt: this.connectionAttempts }, 'Connection 405, reconnecting...');
-        setTimeout(() => this.connect(), 3000);
-      } else if (this.pairingCode && (statusCode === 515 || reason?.includes('restart required'))) {
-        this.logger.info('Waiting for pairing code to be used, not reconnecting automatically');
-      } else if (statusCode === 515 || reason?.includes('restart required')) {
-        this.logger.info('Restart required after pairing, reconnecting...');
-        setTimeout(() => this.connect(), 2000);
-      } else if (statusCode === 401 || reason === 'BadSession' || reason === 'invalid_mechanisms') {
-        this.logger.warn('Session invalid, restarting...');
-        this.logout();
-        setTimeout(() => this.connect(), 2000);
-      } else {
-        this.status = 'disconnected';
-        this._emitToSession('disconnected');
+      if (decision.action === 'stop') {
+        this._clearReconnectTimer();
+        this.status = decision.status;
+        this.nextReconnectAt = null;
+        this.logger.warn({ statusCode, reason }, 'La sesión se detuvo y las credenciales se conservan');
         this._emitToSession('status', this.status);
+        return;
       }
+
+      this.reconnectAttempt += 1;
+      this.status = 'reconnecting';
+      const delay = decision.delayMs ?? reconnectDelayMs(this.reconnectAttempt);
+      this.nextReconnectAt = new Date(Date.now() + delay).toISOString();
+      this.logger.warn({ statusCode, reason, attempt: this.reconnectAttempt, delay }, 'Reconectando la línea');
+      this._emitToSession('status', this.status);
+      this._scheduleReconnect(delay);
     } else if (connection === 'open') {
+      this._clearReconnectTimer();
+      this.reconnectAttempt = 0;
+      this.nextReconnectAt = null;
       this.qrCode = null;
       this.pairingCode = null;
       this.status = 'connected';
@@ -228,8 +312,15 @@ export class WhatsAppSession {
   }
 
   _handleMessages(messages) {
+    let changed = false;
+    const addedIds = [];
     for (const msg of messages) {
-      if (!msg.message) continue;
+      if (!msg.message) {
+        if (msg.messageStubType === proto.WebMessageInfo.StubType.CIPHERTEXT) {
+          continue;
+        }
+        continue;
+      }
 
       this.messageStore.set(msg.key.id, msg);
       if (this.messageStore.size > 5000) {
@@ -248,20 +339,19 @@ export class WhatsAppSession {
       const msgObj = msg.message;
       const parsedMsg = this._parseMessage(msgObj);
 
-      let chatKey = normalizePhoneKey(jidClean);
-
-      if (!msg.key.fromMe && senderPhone) {
-        const normalizedSender = senderPhone.replace(/\D/g, '');
-        for (const [phone, mappedJid] of this.jidToPhone.entries()) {
-          if (phone === normalizedSender || mappedJid === normalizedSender) {
-            chatKey = phone;
+      const lid = typeof jid === 'string' && jid.endsWith('@lid') ? jid : null;
+      const senderDigits = digits(senderPhone);
+      const lidTail = lid ? digits(lid.split('@')[0]).slice(-10) : '';
+      let chatKey = senderDigits && senderDigits !== lidTail ? senderDigits : '';
+      if (!chatKey && lid) {
+        for (const [key, existing] of this.chats) {
+          if ((existing.messages || []).some((item) => item.jid === lid)) {
+            chatKey = key;
             break;
           }
         }
-        if (chatKey === normalizePhoneKey(jidClean)) {
-          chatKey = normalizePhoneKey(senderPhone);
-        }
       }
+      if (!chatKey) chatKey = lid || digits(jidClean);
 
       if (!this.chats.has(chatKey)) {
         this.chats.set(chatKey, {
@@ -274,13 +364,11 @@ export class WhatsAppSession {
       }
 
       const chat = this.chats.get(chatKey);
-      const existingMsg = chat.messages.find(m => m.id === msg.key.id);
-      if (existingMsg) continue;
-
       const msgData = {
         id: msg.key.id,
         text: parsedMsg.text,
         timestamp: formatTimestamp(msg.messageTimestamp),
+        waTimestamp: Number(msg.messageTimestamp) || undefined,
         isOutgoing: msg.key.fromMe,
         jid: jid,
         senderPhone: senderPhone,
@@ -295,9 +383,7 @@ export class WhatsAppSession {
         quotedMsg: parsedMsg.quotedMsg,
       };
 
-      chat.messages.push(msgData);
-      chat.lastMessage = msgData;
-      chat.timestamp = Date.now();
+      if (!upsertChatMessage(chat, msgData)) continue;
 
       if (msg.key.fromMe) {
         this.jidToPhone.set(chatKey, jidClean);
@@ -305,12 +391,32 @@ export class WhatsAppSession {
         this.jidToPhone.set(senderPhone, jidClean);
       }
 
-      this._emitToSession('new_message', { phone: chatKey, message: msgData, chat });
-      this.logger.debug(`Message from ${chatKey}: ${parsedMsg.text?.substring(0, 30)}`);
+      this.logger.info({ phone: chatKey, content: Boolean(msgData.text || msgData.mediaType) }, 'Message stored');
+      addedIds.push(msgData.id);
+      changed = true;
+    }
+    if (changed) {
+      this.consolidateChats();
+      this.persistChats();
+      for (const id of addedIds) {
+        const stored = Array.from(this.chats.values()).find((chat) => chat.messages.some((item) => item.id === id));
+        const fresh = stored?.messages.find((item) => item.id === id);
+        if (!stored || !fresh) continue;
+        this._emitToSession('new_message', {
+          phone: stored.phone,
+          message: toPublicMessage(fresh),
+          chat: {
+            phone: stored.phone,
+            name: stored.name,
+            messageCount: stored.messages.length,
+          },
+        });
+      }
     }
   }
 
   _parseMessage(msgObj) {
+    msgObj = extractMessageContent(msgObj) || msgObj;
     let text = '';
     let mediaType = null;
     let mediaThumbnail = null;
@@ -335,12 +441,10 @@ export class WhatsAppSession {
       mediaType = 'image';
       mediaMimeType = msgObj.imageMessage.mimetype;
       mediaUrl = msgObj.imageMessage.url;
-      mediaKey = msgObj.imageMessage.mediaKey;
+      mediaKey = normalizeMediaKey(msgObj.imageMessage.mediaKey);
       mediaDirectPath = msgObj.imageMessage.directPath;
-      mediaFileLength = msgObj.imageMessage.fileLength;
-      if (msgObj.imageMessage.jpegThumbnail) {
-        mediaThumbnail = Buffer.from(msgObj.imageMessage.jpegThumbnail).toString('base64');
-      }
+      mediaFileLength = normalizeFileLength(msgObj.imageMessage.fileLength);
+      mediaThumbnail = thumbnailToBase64(msgObj.imageMessage.jpegThumbnail);
       const ext = mediaMimeType?.split('/')[1] || 'jpg';
       mediaFileName = `image-${Date.now()}.${ext}`;
     } else if (msgObj.videoMessage) {
@@ -348,23 +452,23 @@ export class WhatsAppSession {
       mediaType = 'video';
       mediaMimeType = msgObj.videoMessage.mimetype;
       mediaUrl = msgObj.videoMessage.url;
-      mediaKey = msgObj.videoMessage.mediaKey;
+      mediaKey = normalizeMediaKey(msgObj.videoMessage.mediaKey);
       mediaDirectPath = msgObj.videoMessage.directPath;
-      mediaFileLength = msgObj.videoMessage.fileLength;
-      if (msgObj.videoMessage.jpegThumbnail) {
-        mediaThumbnail = Buffer.from(msgObj.videoMessage.jpegThumbnail).toString('base64');
-      }
+      mediaFileLength = normalizeFileLength(msgObj.videoMessage.fileLength);
+      mediaThumbnail = thumbnailToBase64(msgObj.videoMessage.jpegThumbnail);
       const ext = mediaMimeType?.split('/')[1] || 'mp4';
       mediaFileName = `video-${Date.now()}.${ext}`;
-    } else if (msgObj.documentMessage) {
-      text = msgObj.documentMessage.caption || msgObj.documentMessage.fileName || '[Documento]';
+    } else if (msgObj.documentMessage || msgObj.documentWithCaptionMessage?.message?.documentMessage) {
+      const document = msgObj.documentMessage || msgObj.documentWithCaptionMessage.message.documentMessage;
+      text = document.caption || document.fileName || '[Documento]';
       mediaType = 'document';
-      mediaMimeType = msgObj.documentMessage.mimetype;
-      mediaFileName = msgObj.documentMessage.fileName;
-      mediaUrl = msgObj.documentMessage.url;
-      mediaKey = msgObj.documentMessage.mediaKey;
-      mediaDirectPath = msgObj.documentMessage.directPath;
-      mediaFileLength = msgObj.documentMessage.fileLength;
+      mediaMimeType = document.mimetype;
+      mediaFileName = document.fileName;
+      mediaUrl = document.url;
+      mediaKey = normalizeMediaKey(document.mediaKey);
+      mediaDirectPath = document.directPath;
+      mediaFileLength = normalizeFileLength(document.fileLength);
+      mediaThumbnail = thumbnailToBase64(document.jpegThumbnail);
       const ext = mediaMimeType?.split('/')[1] || 'bin';
       mediaFileName = mediaFileName || `document-${Date.now()}.${ext}`;
     } else if (msgObj.audioMessage) {
@@ -372,11 +476,29 @@ export class WhatsAppSession {
       mediaType = 'audio';
       mediaMimeType = msgObj.audioMessage.mimetype;
       mediaUrl = msgObj.audioMessage.url;
-      mediaKey = msgObj.audioMessage.mediaKey;
+      mediaKey = normalizeMediaKey(msgObj.audioMessage.mediaKey);
       mediaDirectPath = msgObj.audioMessage.directPath;
-      mediaFileLength = msgObj.audioMessage.fileLength;
-      let ext = mediaMimeType?.split(';')[0]?.split('/')[1] || 'ogg';
+      mediaFileLength = normalizeFileLength(msgObj.audioMessage.fileLength);
+      const ext = mediaMimeType?.split(';')[0]?.split('/')[1] || 'ogg';
       mediaFileName = `audio-${Date.now()}.${ext}`;
+    } else if (msgObj.stickerMessage) {
+      text = '[Sticker]';
+      mediaType = 'sticker';
+      mediaMimeType = msgObj.stickerMessage.mimetype || 'image/webp';
+      mediaUrl = msgObj.stickerMessage.url;
+      mediaKey = normalizeMediaKey(msgObj.stickerMessage.mediaKey);
+      mediaDirectPath = msgObj.stickerMessage.directPath;
+      mediaFileLength = normalizeFileLength(msgObj.stickerMessage.fileLength);
+      mediaFileName = 'sticker.webp';
+    } else if (msgObj.contactMessage) {
+      text = msgObj.contactMessage.displayName || '[Contacto]';
+    } else if (msgObj.locationMessage || msgObj.liveLocationMessage) {
+      text = msgObj.liveLocationMessage ? '[Ubicación en vivo]' : '[Ubicación]';
+    } else if (msgObj.pollCreationMessage || msgObj.pollCreationMessageV3) {
+      const poll = msgObj.pollCreationMessage || msgObj.pollCreationMessageV3;
+      text = poll.name || '[Encuesta]';
+    } else if (msgObj.reactionMessage?.text) {
+      text = msgObj.reactionMessage.text;
     }
 
     return { text, mediaType, mediaThumbnail, mediaMimeType, mediaFileName, mediaUrl, mediaKey, mediaDirectPath, mediaFileLength, quotedMsg };
@@ -401,9 +523,10 @@ export class WhatsAppSession {
   }
 
   _handleHistorySync(newChats, newMessages) {
-    if (!newChats) return;
+    if (!newChats && !newMessages) return;
+    let changed = false;
 
-    for (const chat of newChats) {
+    for (const chat of newChats || []) {
       const jid = chat.id?._serialized || chat.id;
       if (!jid) continue;
 
@@ -419,6 +542,7 @@ export class WhatsAppSession {
           lastMessage: null,
           timestamp: chat.lastMessageRecv ? chat.lastMessageRecv * 1000 : Date.now(),
         });
+        changed = true;
       }
     }
 
@@ -436,16 +560,15 @@ export class WhatsAppSession {
 
         if (!this.chats.has(phone)) {
           this.chats.set(phone, { phone, name: phone, messages: [], lastMessage: null, timestamp: Date.now() });
+          changed = true;
         }
 
         const chat = this.chats.get(phone);
-        const existingMsg = chat.messages.find(m => m.id === msg.key.id);
-        if (existingMsg) continue;
-
         const msgData = {
           id: msg.key.id,
           text: parsedMsg.text,
           timestamp: formatTimestamp(msg.messageTimestamp),
+          waTimestamp: Number(msg.messageTimestamp) || undefined,
           isOutgoing: msg.key.fromMe,
           jid: jid,
           senderPhone: msg.key.senderPn ? extractPhoneFromJid(msg.key.senderPn) : null,
@@ -460,11 +583,14 @@ export class WhatsAppSession {
           quotedMsg: parsedMsg.quotedMsg,
         };
 
-        chat.messages.push(msgData);
-        chat.lastMessage = msgData;
+        if (upsertChatMessage(chat, msgData)) changed = true;
       }
     }
 
+    if (changed) {
+      this.consolidateChats();
+      this.persistChats();
+    }
     this._emitToSession('chats_loaded', { count: this.chats.size });
     this.logger.info(`History sync: ${this.chats.size} chats`);
   }
@@ -477,13 +603,42 @@ export class WhatsAppSession {
     }
   }
 
+  persistChats() {
+    this._dirty = true;
+    this._saveChain = this._saveChain
+      .catch(() => {})
+      .then(() => this._writeChats())
+      .catch((error) => {
+        this.logger.error(`Error guardando chats: ${error.message}`);
+      });
+  }
+
+  async _writeChats() {
+    if (!this._dirty) return;
+    this._dirty = false;
+    const saved = saveChats(this.sessionId, this.chats);
+    if (!saved) {
+      this._dirty = true;
+      throw new Error('No se pudo guardar el historial');
+    }
+  }
+
+  flushChats() {
+    if (!this._dirty) return;
+    this._dirty = false;
+    const saved = saveChats(this.sessionId, this.chats);
+    if (!saved) {
+      this._dirty = true;
+      this.logger.error('Error guardando chats');
+    }
+  }
+
   startAutoSave() {
+    if (this.saveInterval) return;
     this.saveInterval = setInterval(() => {
-      if (this.chats.size > 0) {
-        saveChats(this.sessionId, this.chats);
-        this.logger.debug('Chats auto-saved');
-      }
-    }, 30000);
+      if (this._dirty) this.flushChats();
+    }, 60000);
+    this.saveInterval.unref?.();
   }
 
   stopAutoSave() {
@@ -517,7 +672,7 @@ export class WhatsAppSession {
 
       this.logger.info('Socket ready, requesting pairing code');
       const code = await this.sock.requestPairingCode(cleanPhone);
-      this.logger.info(`Pairing code received: ${code}`);
+      this.logger.info('Pairing code received');
       this.pairingCode = code;
       this.status = 'waiting_pairing';
       this._emitToSession('pairing_code', { code, phone: cleanPhone });
@@ -552,25 +707,38 @@ export class WhatsAppSession {
     const cleanPhone = phone.replace(/\D/g, '');
     const jid = await this._phoneToJid(cleanPhone);
 
-    let messageContent = {};
-    const file = files[0];
-    const mimeType = file.mimetype;
-
-    if (mimeType.startsWith('image/')) {
-      messageContent = { image: { url: file.path }, caption: message };
-    } else if (mimeType.startsWith('video/')) {
-      messageContent = { video: { url: file.path }, caption: message };
-    } else if (mimeType.startsWith('audio/')) {
-      messageContent = { audio: { url: file.path } };
-    } else {
-      messageContent = { document: { url: file.path }, fileName: file.originalname, caption: message };
+    if (!files?.length) {
+      throw new Error('No hay archivos para enviar');
     }
 
-    const sent = await this.sock.sendMessage(jid, messageContent);
-    if (sent) this.messageStore.set(sent.key.id, sent);
+    const messageIds = [];
+    let caption = String(message || '').trim();
+
+    for (const file of files) {
+      const built = buildOutgoingContent({
+        buffer: fs.readFileSync(file.path),
+        mimetype: file.mimetype,
+        fileName: path.basename(file.originalname || 'archivo'),
+      }, caption);
+      caption = '';
+
+      if (built.leadingText) {
+        const textSent = await this.sock.sendMessage(jid, { text: built.leadingText });
+        if (textSent?.key?.id) {
+          this.messageStore.set(textSent.key.id, textSent);
+          messageIds.push(textSent.key.id);
+        }
+      }
+
+      const sent = await this.sock.sendMessage(jid, built.content);
+      if (sent?.key?.id) {
+        this.messageStore.set(sent.key.id, sent);
+        messageIds.push(sent.key.id);
+      }
+    }
 
     this.logger.info(`Message with file sent to ${phone}`);
-    return { success: true, messageId: sent?.key?.id, phone: cleanPhone };
+    return { success: true, messageId: messageIds[0] || null, messageIds, phone: cleanPhone };
   }
 
   async _phoneToJid(phone) {
@@ -630,25 +798,42 @@ export class WhatsAppSession {
     return { exists: false, phone: cleanPhone };
   }
 
+  consolidateChats() {
+    const grouped = groupConversations(this.chats);
+    const next = new Map(grouped.map((chat) => [chat.phone, chat]));
+    let changed = next.size !== this.chats.size;
+    if (!changed) {
+      for (const [key, chat] of next) {
+        const previous = this.chats.get(key);
+        if (!previous || previous.phone !== chat.phone || previous.messages.length !== chat.messages.length) {
+          changed = true;
+          break;
+        }
+      }
+    }
+    if (changed) {
+      this.chats = next;
+      this._dirty = true;
+      this.persistChats();
+    }
+    return Array.from(this.chats.values());
+  }
+
   getChats() {
-    return Array.from(this.chats.values())
-      .sort((a, b) => b.timestamp - a.timestamp)
-      .map(chat => ({
-        phone: chat.phone,
-        name: chat.name,
-        lastMessage: chat.lastMessage,
-        messageCount: chat.messages.length,
-      }));
+    return this.consolidateChats()
+      .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+      .map((chat) => {
+        const summary = toChatSummary(chat);
+        return {
+          ...summary,
+          lastMessage: toPublicMessage(summary.lastMessage),
+        };
+      });
   }
 
   getChat(phone) {
-    const normalizedPhone = phone.replace(/\D/g, '');
-    for (const [key, chat] of this.chats.entries()) {
-      if (normalizePhoneKey(key) === normalizePhoneKey(normalizedPhone)) {
-        return chat;
-      }
-    }
-    return null;
+    this.consolidateChats();
+    return findConversation(this.chats, phone);
   }
 
   getChatMessages(phone) {
@@ -680,22 +865,33 @@ export class WhatsAppSession {
     };
 
     const msgKeyType = mediaMessageTypes[message.mediaType];
+    const mediaKey = mediaKeyToBuffer(message.mediaKey);
+    if (!mediaKey) {
+      throw new Error('El archivo no tiene llave de descarga');
+    }
     const mockMessage = {
-      key: { id: message.id },
+      key: {
+        id: message.id,
+        remoteJid: message.jid,
+        fromMe: Boolean(message.isOutgoing),
+      },
       message: {
         [msgKeyType]: {
           url: message.mediaUrl,
-          mediaKey: message.mediaKey,
+          mediaKey,
           directPath: message.mediaDirectPath,
           mimetype: message.mediaMimeType,
-          fileLength: message.mediaFileLength,
+          fileLength: normalizeFileLength(message.mediaFileLength),
           fileName: message.mediaFileName,
         },
       },
     };
 
     try {
-      const buffer = await downloadMediaMessage(mockMessage, 'buffer', {});
+      const buffer = await downloadMediaMessage(mockMessage, 'buffer', {}, {
+        logger: this.logger,
+        reuploadRequest: (msg) => this.sock?.updateMediaMessage(msg),
+      });
       const ext = extensionForMediaMessage(mockMessage.message);
       const fileName = message.mediaFileName || `media-${message.id}.${ext}`;
       return { buffer, fileName, mimeType: message.mediaMimeType };
@@ -711,26 +907,32 @@ export class WhatsAppSession {
       phoneNumber: this.phoneNumber,
       status: this.status,
       connectedAt: this.connectedAt,
-      hasQR: !!this.qrCode,
-      qrCode: this.qrCode,
-      hasPairing: !!this.pairingCode,
-      pairingCode: this.pairingCode || null,
+      hasQR: this.status === 'waiting_qr' && !!this.qrCode,
+      qrCode: this.status === 'waiting_qr' ? this.qrCode : null,
+      hasPairing: this.status === 'waiting_pairing' && !!this.pairingCode,
+      pairingCode: this.status === 'waiting_pairing' ? this.pairingCode : null,
+      reconnectAttempt: this.reconnectAttempt,
+      nextReconnectAt: this.nextReconnectAt,
+      lastDisconnect: this.lastDisconnect,
     };
   }
 
   async logout() {
+    this.socketGeneration += 1;
+    this._clearReconnectTimer();
     this.stopAutoSave();
-
-    if (this.sock) {
+    const sock = this.sock;
+    this.sock = null;
+    if (sock) {
       try {
-        await this.sock.logout();
+        await sock.logout();
       } catch (e) {
         this.logger.warn(`Logout error: ${e.message}`);
       }
-      this.sock = null;
     }
 
     deleteSessionFolders(this.sessionId);
+    this._dirty = false;
     this.status = 'disconnected';
     this.qrCode = null;
     this.pairingCode = null;
@@ -741,11 +943,16 @@ export class WhatsAppSession {
   }
 
   async disconnect() {
+    this.socketGeneration += 1;
+    this._clearReconnectTimer();
     this.stopAutoSave();
-    if (this.sock) {
-      this.sock.end(undefined);
-      this.sock = null;
+    this._retireSocket();
+    try {
+      await this._saveChain;
+    } catch (error) {
+      this.logger.warn(`Guardado pendiente falló: ${error.message}`);
     }
+    this.flushChats();
     this.status = 'disconnected';
     this.logger.info('Session disconnected');
   }
